@@ -133,7 +133,7 @@ def submit_job():
 
     # Create controlnet specs
     controlnet_specs = {
-        "canny": {
+        "edge": {
             "control_weight": float(data["control_weight"]),
         },
     }
