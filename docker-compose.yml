@@ -2,14 +2,18 @@ services:
   isaac-lab:
     image: nvcr.io/nvidia/gr00t-smmg-bp:1.0
     privileged: true
-    network_mode: host
-    # ports:
-    #   - '49100:49100/tcp'  # Livestream
-    #   - '47998:47998/udp'  # Livestream
-    #   - '8888:8888'        # JupyterLab
+    # Switch from host network to published ports for VNC access
+    # network_mode: host
+    ports:
+      - '8888:8888'        # JupyterLab
+      - '5900:5900'        # VNC Server
+      - '6080:6080'        # noVNC Web Access
+      - '49100:49100/tcp'  # Livestream
+      - '47998:47998/udp'  # Livestream
     environment:
       ACCEPT_EULA: Y
-      DISPLAY: ${DISPLAY}
+      DISPLAY: :1           # Use virtual display
+      VNC_PASSWORD: password # VNC password
     runtime: nvidia
     pull_policy: always
     deploy:
