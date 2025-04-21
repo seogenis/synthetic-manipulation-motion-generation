@@ -123,3 +123,7 @@ The main workflow is implemented in `generate_dataset.ipynb`:
 
 - Video encoding may fail with error `NV_ENC_ERR_UNSUPPORTED_DEVICE` on certain hardware
 - Docker memory limits may need adjustment for large batch processing
+
+## Current instance hardware
+- 2 x H100 GPUs
+- 128 CPU cores

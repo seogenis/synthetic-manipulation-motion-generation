@@ -87,7 +87,8 @@ def get_env_trial_frames(root_dir: str, camera_name: str, min_frames: int = 30) 
     return valid_trials
 
 def encode_video(root_dir: str, start_frame: int, num_frames: int, camera_name: str, output_path: str, env_num: int, trial_num: int) -> None:
-    """Encode a sequence of shaded segmentation frames into a video.
+    """CPU-based encoding of a sequence of shaded segmentation frames into a video.
+    Includes both GPU and CPU fallback implementations.
 
     Args:
         root_dir: Directory containing the input frames
@@ -101,7 +102,15 @@ def encode_video(root_dir: str, start_frame: int, num_frames: int, camera_name: 
     Raises:
         ValueError: If start_frame is negative or if any required frame is missing
     """
-    from video_encoding import get_video_encoding_interface
+    try:
+        import cv2
+    except ImportError:
+        # If OpenCV is not installed, try to install it
+        import subprocess
+        import sys
+        print("OpenCV not found. Attempting to install...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "opencv-python"])
+        import cv2
 
     if start_frame < 0:
         raise ValueError("start_frame must be non-negative")
@@ -117,40 +126,111 @@ def encode_video(root_dir: str, start_frame: int, num_frames: int, camera_name: 
         if not os.path.exists(file_path_normals) or not os.path.exists(file_path_segmentation):
             raise ValueError(f"Missing frame at frame index {frame_idx} for trial {trial_num}")
 
-    # Initialize video encoding
-    video_encoding = get_video_encoding_interface()
-    
     # Get dimensions from first frame
     first_frame = np.array(Image.open(os.path.join(
         root_dir, frame_name_pattern.format(camera_name=camera_name, modality="semantic_segmentation", trial_num=trial_num, env_num=env_num, frame_idx=start_frame))))
     height, width = first_frame.shape[:2]
     
-    # Pre-allocate buffers
-    normals_wp = wp.empty((height, width, 3), dtype=wp.float32, device="cuda")
-    segmentation_wp = wp.empty((height, width, 4), dtype=wp.uint8, device="cuda")
-    shaded_segmentation_wp = wp.empty_like(segmentation_wp)
-    light_source = wp.array(DEFAULT_LIGHT_DIRECTION, dtype=wp.vec3f, device="cuda")
-
-    video_encoding.start_encoding(
-        video_filename=output_path,
-        framerate=DEFAULT_FRAMERATE,
-        nframes=num_frames,
-        overwrite_video=True,
-    )
+    # Make sure output directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Initialize video writer with MP4V codec
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(output_path, fourcc, DEFAULT_FRAMERATE, (width, height))
+    
+    if not video_writer.isOpened():
+        raise ValueError(f"Failed to open video writer for {output_path}")
+    
+    print(f"Encoding {num_frames} frames to {output_path}...")
+    
+    # Try to use GPU processing with warp, fall back to CPU if it fails
+    use_gpu = True
+    try:
+        # Initialize WARP GPU resources
+        normals_wp = wp.empty((height, width, 3), dtype=wp.float32, device="cuda")
+        segmentation_wp = wp.empty((height, width, 4), dtype=wp.uint8, device="cuda")
+        shaded_segmentation_wp = wp.empty_like(segmentation_wp)
+        light_source = wp.array(DEFAULT_LIGHT_DIRECTION, dtype=wp.vec3f, device="cuda")
+    except Exception as e:
+        print(f"GPU processing initialization failed: {e}")
+        print("Falling back to CPU-only processing...")
+        use_gpu = False
+    
+    # Normalize light direction for CPU processing
+    light_direction = np.array(DEFAULT_LIGHT_DIRECTION)
+    light_direction = light_direction / np.linalg.norm(light_direction)
 
     for frame_idx in range(start_frame, start_frame + num_frames):
         file_path_normals = os.path.join(root_dir, frame_name_pattern.format(camera_name=camera_name, modality="normals", trial_num=trial_num, env_num=env_num, frame_idx=frame_idx))
         file_path_segmentation = os.path.join(root_dir, frame_name_pattern.format(camera_name=camera_name, modality="semantic_segmentation", trial_num=trial_num, env_num=env_num, frame_idx=frame_idx))
         
-        # Load and copy data to existing buffers
+        # Load frame data
         normals_np = np.array(Image.open(file_path_normals)).astype(np.float32) / 255.0
-        wp.copy(normals_wp, wp.from_numpy(normals_np))
-        
         segmentation_np = np.array(Image.open(file_path_segmentation))
-        wp.copy(segmentation_wp, wp.from_numpy(segmentation_np))
-    
-        # Launch kernel
-        wp.launch(_shade_segmentation, dim=(height, width), inputs=[segmentation_wp, normals_wp, shaded_segmentation_wp, light_source])
         
-        # Encode frame
-        video_encoding.encode_next_frame_from_buffer(shaded_segmentation_wp.numpy().tobytes(), width=width, height=height)
+        if use_gpu:
+            try:
+                # GPU-based processing with WARP
+                wp.copy(normals_wp, wp.from_numpy(normals_np))
+                wp.copy(segmentation_wp, wp.from_numpy(segmentation_np))
+                
+                # Launch kernel for shading calculation
+                wp.launch(_shade_segmentation, dim=(height, width), inputs=[segmentation_wp, normals_wp, shaded_segmentation_wp, light_source])
+                
+                # Get the shaded image from GPU
+                shaded_frame = shaded_segmentation_wp.numpy()
+            except Exception as e:
+                print(f"GPU processing failed on frame {frame_idx}: {e}")
+                print("Switching to CPU-only processing for remaining frames...")
+                use_gpu = False
+                # Process this frame with CPU since GPU failed
+                shaded_frame = np.zeros_like(segmentation_np)
+                cpu_shade_segmentation(normals_np, segmentation_np, shaded_frame, light_direction)
+        else:
+            # CPU-based processing
+            shaded_frame = np.zeros_like(segmentation_np)
+            cpu_shade_segmentation(normals_np, segmentation_np, shaded_frame, light_direction)
+        
+        # OpenCV expects BGR format
+        if shaded_frame.shape[2] >= 3:
+            # Use only the first 3 channels (RGB/BGR)
+            cv_frame = shaded_frame[:, :, :3]
+            # Write frame to video
+            video_writer.write(cv_frame)
+        else:
+            print(f"Warning: Frame has unexpected shape {shaded_frame.shape}")
+    
+    # Finalize video
+    video_writer.release()
+    print(f"Video successfully encoded to {output_path}")
+
+def cpu_shade_segmentation(normals, segmentation, output, light_direction):
+    """CPU implementation of shading calculation.
+    
+    Args:
+        normals: Normal vectors (H,W,3) as float32 array
+        segmentation: Input segmentation image (H,W,C)
+        output: Output buffer for shaded result (H,W,C)
+        light_direction: Normalized light direction vector
+    """
+    height, width = normals.shape[:2]
+    channels = min(segmentation.shape[2], output.shape[2])
+    
+    # Parallel processing with numpy operations
+    # Calculate dot product between normals and light direction
+    # Reshape light_direction to (1,1,3) for broadcasting
+    light = light_direction.reshape(1, 1, 3)
+    dot_product = np.sum(normals * light, axis=2, keepdims=True)
+    
+    # Apply shading: 0.5 + dot_product * 0.5
+    shading = 0.5 + 0.5 * dot_product
+    
+    # Apply shading to each channel
+    for c in range(channels):
+        output[:, :, c] = segmentation[:, :, c] * shading[:, :, 0]
+    
+    # Set alpha channel if it exists
+    if output.shape[2] > 3 and segmentation.shape[2] > 3:
+        output[:, :, 3] = segmentation[:, :, 3]
+    elif output.shape[2] > 3:
+        output[:, :, 3] = 255
