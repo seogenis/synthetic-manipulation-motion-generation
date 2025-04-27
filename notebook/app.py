@@ -42,10 +42,17 @@ def process_video_job(job_id: str, output_video_path: str, cmd: list, env: dict)
     job = jobs[job_id]
     
     try:
-        # Execute the command
-        print("Executing command: ", cmd)
+        # Construct the command with conda activation
+        conda_prefix = os.environ.get("CONDA_PREFIX", "")
+        conda_base = subprocess.check_output("conda info --base", shell=True).decode().strip()
+        
+        # Create the full command with conda activation
+        full_cmd = f"source {conda_base}/etc/profile.d/conda.sh && conda activate cosmos-transfer1 && {' '.join(cmd)}"
+        
+        # Execute the command through bash
+        print("Executing command: ", full_cmd)
         process = subprocess.Popen(
-            cmd,
+            ["bash", "-c", full_cmd],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
@@ -141,10 +148,17 @@ def submit_job():
     with open(specs_path, "w") as f:
         json.dump(controlnet_specs, f)
 
-    # Construct the command
+    # Get number of GPUs, default to 1
+    num_gpus = int(os.environ.get("NUM_GPU", 1))
+    
+    # Construct the command with torchrun
     cmd = [
-        "python",
+        "torchrun",
+        "--nproc_per_node=" + str(num_gpus),
+        "--nnodes=1",
+        "--node_rank=0",
         CONTROL2WORLD_PATH,
+        "--checkpoint_dir", "checkpoints",
         "--prompt", data["prompt"],
         "--canny_threshold", str(data["canny_strength"]),
         "--input_video_path", input_video_path,
@@ -153,12 +167,15 @@ def submit_job():
         "--sigma_max", str(data["sigma_max"]),
         "--controlnet_specs", specs_path,
         "--seed", str(data["seed"]),
+        "--offload_guardrail_models",
+        "--num_gpus", str(num_gpus)
     ]
     
     try:
-        # Set PYTHONPATH environment variable
+        # Set necessary environment variables
         env = os.environ.copy()
         env["PYTHONPATH"] = os.getcwd()
+        env["CUDA_HOME"] = os.environ.get("CONDA_PREFIX", "")
         
         # Create job status object
         job_status = JobStatus()
